@@ -18,6 +18,7 @@ from pathlib import Path
 from extract import PRICES
 
 HERE = Path(__file__).parent
+APPS = ["claude_code", "cowork"]   # row value = index; Claude Code first
 MODEL_LABELS = {
     "claude-fable-5-1": "Fable 5.1", "claude-fable-5": "Fable 5", "claude-opus-5-5": "Opus 5.5",
     "claude-opus-5": "Opus 5", "claude-opus-4-8": "Opus 4.8", "claude-opus-4-7": "Opus 4.7",
@@ -71,6 +72,9 @@ def build(db_path: Path) -> dict:
     fam_ix = {f: i for i, f in enumerate(fams)}
     models = [MODEL_LABELS.get(f, f) if f != "other" else "Other" for f in fams]
 
+    def app_of(r, col="source"):
+        return APPS.index(r[col]) if r[col] in APPS else 0
+
     def proj_of(r):
         return proj(sess_project.get(r["session_id"]) or short_project(r["project"]))
 
@@ -91,7 +95,7 @@ def build(db_path: Path) -> dict:
             fam_ix.get(r["model_family"], len(fams) - 1), int(r["ts_local"][11:13]),
             r["input_tokens"] or 0, r["output_tokens"] or 0, r["cache_read_tokens"] or 0,
             r["cache_write_tokens"] or 0, round(c_in, 5), round(c_out, 5), round(c_cr, 5),
-            round(c_cw, 5), ctx])
+            round(c_cw, 5), ctx, app_of(r)])
 
     toolcalls = []
     for r in q("select * from tool_calls where ts_local is not null"):
@@ -104,13 +108,19 @@ def build(db_path: Path) -> dict:
             r["latency_ms"] if r["latency_ms"] is not None else -1,
             detail(d) if d else -1,
             files(r["file_path"].replace("\\", "/")) if r["file_path"] and r["category"] == "file" else -1,
-            1 if r["denied"] else 0])
+            1 if r["denied"] else 0, app_of(r)])
 
-    history = [[day_ix[r["ts_local"][:10]], proj(short_project(r["project"])), int(r["ts_local"][11:13])]
+    # Claude Code prompts come from history.jsonl (longer-lived than transcripts); Cowork has
+    # no history file, so its typed prompts come from the transcripts.
+    history = [[day_ix[r["ts_local"][:10]], proj(short_project(r["project"])), int(r["ts_local"][11:13]), 0]
                for r in q("select ts_local, project from history_prompts where ts_local is not null")
                if r["ts_local"][:10] in day_ix]
+    history += [[day_ix[r["ts_local"][:10]], proj_of(r), int(r["ts_local"][11:13]), 1]
+                for r in q("""select ts_local, session_id, project from prompts
+                              where app = 'cowork' and kind = 'human' and ts_local is not null""")
+                if r["ts_local"][:10] in day_ix]
 
-    compactions = [[day_ix.get(local_day(r["ts"]), 0), proj_of(r), 1 if r["agent_id"] else 0, r["pre_tokens"] or 0]
+    compactions = [[day_ix.get(local_day(r["ts"]), 0), proj_of(r), 1 if r["agent_id"] else 0, r["pre_tokens"] or 0, app_of(r)]
                    for r in q("select * from compactions where ts is not null")]
 
     prs = {r["session_id"]: r["n"] for r in q("select session_id, count(*) n from pr_links group by 1")}
@@ -119,12 +129,29 @@ def build(db_path: Path) -> dict:
         sessions.append([
             r["session_id"], day_ix.get(local_day(r["first_ts"]), 0), proj(short_project(r["project"])),
             r["title"] or "", r["active_ms"] or 0, r["api_calls"], r["tool_calls"], r["subagent_count"],
-            r["compactions"], prs.get(r["session_id"], 0), round(r["est_cost_usd"] or 0, 2), r["human_prompts"]])
+            r["compactions"], prs.get(r["session_id"], 0), round(r["est_cost_usd"] or 0, 2), r["human_prompts"],
+            app_of(r), 1 if r["session_type"] == "scheduled" else 0,
+            round(r["recorded_cost_usd"], 2) if r["recorded_cost_usd"] is not None else -1])
+
+    # Cowork audit data: one row per finished turn, and rate-limit status events.
+    sess_type = {r["session_id"]: r["session_type"] for r in q("select session_id, session_type from sessions")}
+    cw_turns = [[day_ix[r["ts_local"][:10]], proj_of(r), int(r["ts_local"][11:13]), r["duration_ms"] or 0,
+                 r["ttft_ms"] if r["ttft_ms"] is not None else -1, round(r["total_cost_usd"] or 0, 5),
+                 r["is_error"], r["permission_denials"], 1 if sess_type.get(r["session_id"]) == "scheduled" else 0]
+                for r in q("""select t.*, s.project from cowork_turns t left join sessions s using (session_id)
+                              where t.ts_local is not null""")
+                if r["ts_local"][:10] in day_ix]
+    limit_types = Index()
+    rate_limits = [[day_ix[r["ts_local"][:10]], proj_of(r), limit_types(r["rate_limit_type"] or "unknown"),
+                    limit_types(r["overage_status"] or "unknown")]
+                   for r in q("""select e.*, s.project from rate_limit_events e left join sessions s using (session_id)
+                                 where e.ts_local is not null""")
+                   if r["ts_local"][:10] in day_ix]
 
     return dict(built=datetime.now().strftime("%Y-%m-%d %H:%M"), days=days, projects=proj.items,
                 models=models, tools=tool.items, details=detail.items, files=files.items,
                 calls=calls, toolcalls=toolcalls, history=history, compactions=compactions,
-                sessions=sessions)
+                sessions=sessions, cwTurns=cw_turns, rateLimits=rate_limits, limitLabels=limit_types.items)
 
 
 def local_day(ts: str) -> str:

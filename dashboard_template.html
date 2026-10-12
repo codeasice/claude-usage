@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Code usage</title>
+<title>Claude usage</title>
 <style>
 .viz-root {
   color-scheme: light;
@@ -58,6 +58,7 @@ button { cursor: pointer; }
 .seg button:last-child { border-right: 0; }
 .seg button[aria-pressed="true"] { font-weight: 600; background: var(--grid); }
 .spacer { flex: 1; }
+h2.section { font-size: 17px; font-weight: 600; margin: 28px 0 4px; }
 .kpis { display: grid; grid-template-columns: minmax(220px, 1.4fr) repeat(4, minmax(140px, 1fr)); gap: 12px; margin-bottom: 12px; }
 .kpis2 { display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
 .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; min-width: 0; }
@@ -106,13 +107,16 @@ td.wrap { white-space: normal; min-width: 220px; }
 </head>
 <body>
 <div class="viz-root">
-  <h1>Claude Code usage</h1>
+  <h1>Claude usage</h1>
   <p class="sub" id="subtitle"></p>
 
   <div class="filters" role="group" aria-label="Filters">
     <div class="seg" id="range" role="group" aria-label="Date range">
       <button data-v="7">7 days</button><button data-v="30">30 days</button>
       <button data-v="90">90 days</button><button data-v="all">All</button>
+    </div>
+    <div class="seg" id="app" role="group" aria-label="App">
+      <button data-v="all">All apps</button><button data-v="0">Claude Code</button><button data-v="1">Cowork</button>
     </div>
     <label>Project <select id="proj"></select></label>
     <div class="seg" id="thread" role="group" aria-label="Thread">
@@ -126,6 +130,7 @@ td.wrap { white-space: normal; min-width: 220px; }
   <div class="kpis2" id="kpis2"></div>
 
   <div class="grid one"><div class="card" id="c-cost"></div></div>
+  <div class="grid one"><div class="card" id="c-app"></div></div>
   <div class="grid">
     <div class="card" id="c-tokentype"></div>
     <div class="card" id="c-thread"></div>
@@ -148,6 +153,19 @@ td.wrap { white-space: normal; min-width: 220px; }
     <div class="card" id="c-files"></div>
     <div class="card" id="c-skills"></div>
   </div>
+  <section id="cowork">
+    <h2 class="section">Cowork turns</h2>
+    <p class="sub">From each Cowork session's agent log: one turn is one request you (or a schedule) sent, through to the final answer. Date range and project filters apply; the thread filter does not.</p>
+    <div class="kpis2" id="kpis3"></div>
+    <div class="grid">
+      <div class="card" id="c-cw-cost"></div>
+      <div class="card" id="c-cw-dur"></div>
+    </div>
+    <div class="grid">
+      <div class="card" id="c-cw-type"></div>
+      <div class="card" id="c-cw-rate"></div>
+    </div>
+  </section>
   <div id="tip" role="tooltip"></div>
 </div>
 
@@ -159,7 +177,8 @@ const SERIES = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"].map(v =
 const OTHER = "var(--axis)";
 const NS = "http://www.w3.org/2000/svg";
 const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
-const state = { range: "30", proj: -1, thread: "all" };
+const state = { range: "30", proj: -1, thread: "all", app: "all" };
+const APP_NAMES = ["Claude Code", "Cowork"];
 
 // ---------- formatting ----------
 const compact = n => {
@@ -447,8 +466,9 @@ function stackedBar(card, {segments, fmt}) {
 const firstCallDay = D.calls.reduce((m, r) => Math.min(m, r[0]), Infinity);
 const firstHistDay = D.history.reduce((m, r) => Math.min(m, r[0]), Infinity);
 function startIdx() { return state.range === "all" ? 0 : Math.max(0, D.days.length - Number(state.range)); }
-function keep(dayI, proj, sc) {
+function keep(dayI, proj, sc, app) {
   if (dayI < startIdx()) return false;
+  if (app != null && state.app !== "all" && app !== Number(state.app)) return false;
   if (state.proj >= 0 && proj !== state.proj) return false;
   if (sc != null && state.thread === "main" && sc) return false;
   if (sc != null && state.thread === "sub" && !sc) return false;
@@ -458,11 +478,11 @@ function keep(dayI, proj, sc) {
 // ---------- render ----------
 function render() {
   const s0 = startIdx();
-  const calls = D.calls.filter(r => keep(r[0], r[1], r[2]));
-  const tools = D.toolcalls.filter(r => keep(r[0], r[1], r[2]));
-  const hist = D.history.filter(r => keep(r[0], r[1], null));
-  const sess = D.sessions.filter(r => keep(r[1], r[2], null));
-  const comps = D.compactions.filter(r => keep(r[0], r[1], r[2]));
+  const calls = D.calls.filter(r => keep(r[0], r[1], r[2], r[14]));
+  const tools = D.toolcalls.filter(r => keep(r[0], r[1], r[2], r[10]));
+  const hist = D.history.filter(r => keep(r[0], r[1], null, r[3]));
+  const sess = D.sessions.filter(r => keep(r[1], r[2], null, r[12]));
+  const comps = D.compactions.filter(r => keep(r[0], r[1], r[2], r[4]));
   const cost = r => r[9] + r[10] + r[11] + r[12];
   const sum = (arr, f) => arr.reduce((s, r) => s + f(r), 0);
 
@@ -510,6 +530,20 @@ function render() {
         {display: usd(modelSeries.reduce((a, s) => a + s.values[i], 0)), sort: modelSeries.reduce((a, s) => a + s.values[i], 0)}]).reverse(),
       {numeric: modelSeries.map((_, i) => i + 1).concat(modelSeries.length + 1)});
   } else c.append(el("div", {class: "empty"}, "No API calls in this slice"));
+
+  // Claude Code vs Cowork (fixed colors per app, so filtering never repaints)
+  c = document.getElementById("c-app");
+  cardHeader(c, "Claude Code vs Cowork", "Daily estimated cost per app.");
+  const appV = APP_NAMES.map(() => new Array(dayLabels.length).fill(0));
+  for (const r of calls) if (r[0] >= d0) appV[r[14]][r[0] - d0] += cost(r);
+  const appSeries = APP_NAMES.map((name, i) => ({name, color: SERIES[i], values: appV[i], i}))
+    .filter(s => state.app === "all" || s.i === Number(state.app));
+  legend(c, appSeries, true);
+  if (dayLabels.length > 1) lineChart(c, {labels: dayLabels, series: appSeries, fmt: usd, tickFmt: usdTick});
+  tableView(c, ["App", "Cost", "API calls", "Sessions", "Your prompts"], appSeries.map(s => {
+    const rs = calls.filter(r => r[14] === s.i), n = sess.filter(r => r[12] === s.i).length, pr = hist.filter(r => r[3] === s.i).length;
+    return [s.name, {display: usd(sum(rs, cost)), sort: sum(rs, cost)}, {display: intf(rs.length), sort: rs.length}, {display: intf(n), sort: n}, {display: intf(pr), sort: pr}];
+  }), {numeric: [1, 2, 3, 4]});
 
   // Cost by token type
   c = document.getElementById("c-tokentype");
@@ -609,7 +643,7 @@ function render() {
 
   // Long-run prompt history (weekly)
   c = document.getElementById("c-history");
-  cardHeader(c, "Prompts per week", "From your prompt history, which goes back further than the transcripts (those are pruned after ~30 days by default).");
+  cardHeader(c, "Prompts per week", "Claude Code prompts come from your prompt history, which goes back further than the transcripts (those are pruned after ~30 days by default). Cowork prompts come from its transcripts.");
   const h0 = Math.max(s0, firstHistDay === Infinity ? s0 : firstHistDay);
   const weeks = new Map();
   for (let i = h0; i < D.days.length; i++) {
@@ -629,11 +663,12 @@ function render() {
 
   // Sessions table
   c = document.getElementById("c-sessions");
-  cardHeader(c, "Sessions", "Sorted by estimated cost (includes subagents). Click a column header to sort. Titles are Claude Code's auto-generated summaries.");
+  cardHeader(c, "Sessions", "Sorted by estimated cost (includes subagents). Click a column header to sort. Titles are auto-generated summaries. Recorded cost is what Cowork logged itself.");
   const sorted = [...sess].sort((a, b) => b[10] - a[10]);
-  tableView(c, ["Started", "Title", "Project", "Cost", "Active", "Prompts", "API calls", "Tool calls", "Subagents", "Compactions", "MRs"],
-    sorted.map(r => [D.days[r[1]], r[3] || r[0].slice(0, 8), D.projects[r[2]] ?? "", {display: usd(r[10]), sort: r[10]}, {display: dur(r[4]), sort: r[4]},
-      r[11], r[5], r[6], r[7], r[8], r[9]]), {open: true, title: `${sess.length} sessions`, numeric: [3, 4, 5, 6, 7, 8, 9, 10]});
+  tableView(c, ["Started", "Title", "App", "Project", "Cost", "Recorded", "Active", "Prompts", "API calls", "Tool calls", "Subagents", "Compactions", "MRs"],
+    sorted.map(r => [D.days[r[1]], r[3] || r[0].slice(0, 8), APP_NAMES[r[12]] + (r[13] ? " (scheduled)" : ""), D.projects[r[2]] ?? "",
+      {display: usd(r[10]), sort: r[10]}, {display: r[14] < 0 ? "–" : usd(r[14]), sort: r[14]}, {display: dur(r[4]), sort: r[4]},
+      r[11], r[5], r[6], r[7], r[8], r[9]]), {open: true, title: `${sess.length} sessions`, numeric: [4, 5, 6, 7, 8, 9, 10, 11, 12]});
 
   // Files + skills/agents
   c = document.getElementById("c-files");
@@ -658,8 +693,91 @@ function render() {
   tableView(c, ["Name", "Kind", "Calls", "Errors", "Median duration"], sk.map(r => [r.label, kindOf.get(r.k) || "", {display: intf(r.n), sort: r.n},
     {display: intf(r.err), sort: r.err}, {display: r.p50 == null ? "–" : dur(r.p50), sort: r.p50 ?? -1}]), {open: true, title: `${sk.length} skills/agent types`, numeric: [2, 3, 4]});
 
+  renderCowork(calls, cost, sum, d0, dayLabels, tile);
+
   document.getElementById("subtitle").textContent =
-    `Built ${D.built} from ~/.claude · transcripts ${D.days[firstCallDay] ?? "–"} → ${D.days[D.days.length - 1]} · prompt history from ${D.days[firstHistDay] ?? "–"} · no prompt or response text included`;
+    `Built ${D.built} from ~/.claude${D.cwTurns.length ? " and Claude Cowork" : ""} · transcripts ${D.days[firstCallDay] ?? "–"} → ${D.days[D.days.length - 1]} · prompt history from ${D.days[firstHistDay] ?? "–"} · no prompt or response text included`;
+}
+
+// ---------- Cowork ----------
+const LIMIT_NAMES = {five_hour: "5-hour window", overage: "Overage", unknown: "Unspecified"};
+const LIMIT_ORDER = ["five_hour", "overage", "unknown"];
+function renderCowork(calls, cost, sum, d0, dayLabels, tile) {
+  const sec = document.getElementById("cowork");
+  sec.hidden = state.app === "0" || !D.cwTurns.length;
+  if (sec.hidden) return;
+  const turns = D.cwTurns.filter(r => keep(r[0], r[1], null, 1));
+  const limits = D.rateLimits.filter(r => keep(r[0], r[1], null, 1));
+  const cwCalls = calls.filter(r => r[14] === 1);
+  const recorded = sum(turns, r => r[5]), estimated = sum(cwCalls, cost);
+  const durs = turns.map(r => r[3]), ttfts = turns.map(r => r[4]).filter(v => v >= 0);
+  const denials = sum(turns, r => r[7]), sched = turns.filter(r => r[8]).length;
+  const med = quantile(durs, .5), p90d = quantile(durs, .9), ttft = quantile(ttfts, .5);
+  document.getElementById("kpis3").replaceChildren(
+    tile("Turns", intf(turns.length), turns.length ? `${pct(sched / turns.length)} from scheduled tasks` : ""),
+    tile("Recorded cost", usd(recorded), `Cowork's own figure · estimate ${usd(estimated)}`),
+    tile("Median turn", med == null ? "–" : dur(med), p90d == null ? "" : `90th percentile ${dur(p90d)}`),
+    tile("Time to first token", ttft == null ? "–" : dur(ttft), "median, per turn"),
+    tile("Permission denials", intf(denials), `in ${intf(turns.filter(r => r[7]).length)} turns`));
+
+  // Recorded vs estimated
+  let c = document.getElementById("c-cw-cost");
+  cardHeader(c, "Recorded vs estimated cost", "Daily. Recorded is the cost Cowork logged per turn; estimated is token counts × list price, as everywhere else on this page.");
+  const rec = new Array(dayLabels.length).fill(0), est = new Array(dayLabels.length).fill(0);
+  for (const r of turns) if (r[0] >= d0) rec[r[0] - d0] += r[5];
+  for (const r of cwCalls) if (r[0] >= d0) est[r[0] - d0] += cost(r);
+  const costSeries = [{name: "Recorded", color: SERIES[0], values: rec}, {name: "Estimated", color: SERIES[1], values: est}];
+  legend(c, costSeries, true);
+  if (dayLabels.length > 1) lineChart(c, {labels: dayLabels, series: costSeries, fmt: usd, tickFmt: usdTick});
+  tableView(c, ["Date", "Recorded", "Estimated"], dayLabels.map((d, i) => [d, {display: usd(rec[i]), sort: rec[i]}, {display: usd(est[i]), sort: est[i]}])
+    .filter(r => r[1].sort || r[2].sort).reverse(), {numeric: [1, 2]});
+
+  // Turn duration (in minutes so the axis gets round ticks)
+  c = document.getElementById("c-cw-dur");
+  cardHeader(c, "How long turns take", "Daily median and 90th percentile time from request to final answer.");
+  const byDay = dayLabels.map(() => []);
+  for (const r of turns) if (r[0] >= d0) byDay[r[0] - d0].push(r[3] / 60000);
+  const dm = byDay.map(a => quantile(a, .5)), d9 = byDay.map(a => quantile(a, .9));
+  const durSeries = [{name: "Median", color: SERIES[0], values: dm}, {name: "90th percentile", color: SERIES[1], values: d9}];
+  legend(c, durSeries, true);
+  const minFmt = m => dur(m * 60000);
+  if (dayLabels.length > 1) lineChart(c, {labels: dayLabels, series: durSeries, fmt: minFmt, tickFmt: m => Math.round(m * 10) / 10 + " min"});
+  tableView(c, ["Date", "Turns", "Median", "p90"], dayLabels.map((d, i) => [d, byDay[i].length,
+    {display: dm[i] == null ? "–" : minFmt(dm[i]), sort: dm[i] ?? -1}, {display: d9[i] == null ? "–" : minFmt(d9[i]), sort: d9[i] ?? -1}])
+    .filter(r => r[1]).reverse(), {numeric: [1, 2, 3]});
+
+  // Scheduled vs interactive
+  c = document.getElementById("c-cw-type");
+  cardHeader(c, "Scheduled vs interactive", "Share of recorded cost by how the turn started.");
+  const kinds = [{name: "Scheduled tasks", f: r => r[8], color: SERIES[0], ink: "#fff"}, {name: "Interactive", f: r => !r[8], color: SERIES[1], ink: "#0b0b0b"}]
+    .map(k => { const rs = turns.filter(k.f); return {...k, rs, value: sum(rs, r => r[5])}; });
+  legend(c, kinds);
+  stackedBar(c, {segments: kinds, fmt: usd});
+  tableView(c, ["Started by", "Turns", "Recorded cost", "Median turn", "Median first token", "Denials", "Errors"], kinds.map(k => {
+    const m = quantile(k.rs.map(r => r[3]), .5), t = quantile(k.rs.map(r => r[4]).filter(v => v >= 0), .5);
+    return [k.name, {display: intf(k.rs.length), sort: k.rs.length}, {display: usd(k.value), sort: k.value},
+      {display: m == null ? "–" : dur(m), sort: m ?? -1}, {display: t == null ? "–" : dur(t), sort: t ?? -1},
+      sum(k.rs, r => r[7]), sum(k.rs, r => r[6])];
+  }), {open: true, numeric: [1, 2, 3, 4, 5, 6]});
+
+  // Rate-limit events
+  c = document.getElementById("c-cw-rate");
+  cardHeader(c, "Rate-limit events", "Usage-limit status updates Cowork received per day, by limit window. The table splits them by overage status.");
+  const typeIdx = LIMIT_ORDER.map(k => D.limitLabels.indexOf(k));
+  const rv = LIMIT_ORDER.map(() => new Array(dayLabels.length).fill(0));
+  for (const r of limits) if (r[0] >= d0) { const t = typeIdx.indexOf(r[2]); rv[t < 0 ? 2 : t][r[0] - d0]++; }
+  const limSeries = LIMIT_ORDER.map((k, i) => ({name: LIMIT_NAMES[k], color: i === 2 ? OTHER : SERIES[i], values: rv[i]}))
+    .filter(s => s.values.some(v => v));
+  if (limits.length) {
+    legend(c, limSeries);
+    stackedColumns(c, {labels: dayLabels, series: limSeries, fmt: intf, height: 220});
+    const combos = new Map();
+    for (const r of limits) { const k = r[2] + "|" + r[3]; combos.set(k, (combos.get(k) || 0) + 1); }
+    tableView(c, ["Limit window", "Overage status", "Events"], [...combos.entries()].map(([k, n]) => {
+      const [t, st] = k.split("|").map(Number);
+      return [LIMIT_NAMES[D.limitLabels[t]] || D.limitLabels[t], D.limitLabels[st], {display: intf(n), sort: n}];
+    }), {open: true, numeric: [2]});
+  } else c.append(el("div", {class: "empty"}, "No rate-limit events in this slice"));
 }
 
 // ---------- controls ----------
@@ -669,7 +787,7 @@ function seg(id, key) {
   box.addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; state[key] = b.dataset.v; sync(); render(); });
   sync();
 }
-seg("range", "range"); seg("thread", "thread");
+seg("range", "range"); seg("thread", "thread"); seg("app", "app");
 const projSel = document.getElementById("proj");
 const projCost = new Map();
 for (const r of D.calls) projCost.set(r[1], (projCost.get(r[1]) || 0) + r[9] + r[10] + r[11] + r[12]);

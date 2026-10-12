@@ -1,4 +1,11 @@
-"""Extract Claude Code usage metadata from ~/.claude into SQLite + CSV.
+"""Extract Claude Code and Claude Cowork usage metadata into SQLite + CSV.
+
+Sources:
+    Claude Code  ~/.claude (projects/**.jsonl, history.jsonl, stats-cache.json)
+    Cowork       the desktop app's local-agent-mode-sessions folder (Windows:
+                 %APPDATA%/Claude, macOS: ~/Library/Application Support/Claude).
+                 Each Cowork session holds Claude Code-format transcripts plus an
+                 Agent SDK audit.jsonl, of which only numeric/status fields are read.
 
 Deliberately excludes the *content* of prompts, replies, thinking, and tool
 inputs/outputs. What is kept: timestamps, sizes, token counts, costs, models,
@@ -9,6 +16,8 @@ Usage:
     python extract.py                       # writes ./out/usage.sqlite + ./out/csv/*.csv
     python extract.py --claude-dir PATH --out DIR
     python extract.py --no-titles           # also drop the AI-generated session titles
+    python extract.py --no-cowork           # Claude Code only
+    python extract.py --cowork-dir PATH     # non-default Cowork location
 
 Stdlib only. Full rebuild every run (no incremental state).
 """
@@ -17,6 +26,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -29,13 +39,15 @@ SCHEMA = {
     "sessions": """
         session_id TEXT PRIMARY KEY, project TEXT, first_ts TEXT, last_ts TEXT,
         active_ms INTEGER, wall_ms INTEGER, version TEXT, entrypoint TEXT,
-        git_branch TEXT, title TEXT, human_prompts INTEGER, api_calls INTEGER,
+        git_branch TEXT, title TEXT, source TEXT, session_type TEXT,
+        scheduled_task_id TEXT, archived INTEGER, recorded_cost_usd REAL,
+        human_prompts INTEGER, api_calls INTEGER,
         tool_calls INTEGER, subagent_count INTEGER, compactions INTEGER,
         est_cost_usd REAL, last_process_cost_usd REAL, api_ms INTEGER, tool_ms INTEGER,
         lines_added INTEGER, lines_removed INTEGER""",
     "agents": """
         agent_id TEXT, session_id TEXT, agent_type TEXT, workflow_id TEXT,
-        first_ts TEXT, last_ts TEXT, api_calls INTEGER, tool_calls INTEGER,
+        first_ts TEXT, last_ts TEXT, api_calls INTEGER, tool_calls INTEGER, source TEXT,
         PRIMARY KEY (session_id, agent_id)""",
     "api_calls": """
         message_id TEXT, session_id TEXT, agent_id TEXT, is_sidechain INTEGER,
@@ -45,22 +57,24 @@ SCHEMA = {
         web_search INTEGER, web_fetch INTEGER, stop_reason TEXT, tool_uses INTEGER,
         has_thinking INTEGER, has_text INTEGER, speed TEXT, service_tier TEXT,
         effort TEXT, permission_mode TEXT, version TEXT, model_family TEXT,
-        est_cost_usd REAL""",
+        est_cost_usd REAL, source TEXT""",
     "tool_calls": """
         tool_use_id TEXT, message_id TEXT, session_id TEXT, agent_id TEXT,
         is_sidechain INTEGER, project TEXT, ts TEXT, ts_local TEXT, tool TEXT,
         category TEXT, mcp_server TEXT, detail TEXT, file_path TEXT, file_ext TEXT,
         background INTEGER, result_ts TEXT, latency_ms INTEGER, is_error INTEGER,
-        denied TEXT, interrupted INTEGER, result_chars INTEGER, input_chars INTEGER""",
+        denied TEXT, interrupted INTEGER, result_chars INTEGER, input_chars INTEGER,
+        source TEXT""",
     "prompts": """
         session_id TEXT, project TEXT, ts TEXT, ts_local TEXT, kind TEXT,
-        source TEXT, chars INTEGER, slash_command TEXT, permission_mode TEXT""",
+        source TEXT, chars INTEGER, slash_command TEXT, permission_mode TEXT,
+        app TEXT""",
     "turns": """
         session_id TEXT, project TEXT, ts TEXT, ts_local TEXT,
-        duration_ms INTEGER, message_count INTEGER""",
+        duration_ms INTEGER, message_count INTEGER, source TEXT""",
     "compactions": """
         session_id TEXT, agent_id TEXT, project TEXT, ts TEXT, trigger TEXT,
-        pre_tokens INTEGER, post_tokens INTEGER, duration_ms INTEGER""",
+        pre_tokens INTEGER, post_tokens INTEGER, duration_ms INTEGER, source TEXT""",
     "session_model_cost": """
         session_id TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER,
         thinking_tokens INTEGER, cache_read_tokens INTEGER,
@@ -73,7 +87,20 @@ SCHEMA = {
     "stats_daily": """
         date TEXT PRIMARY KEY, messages INTEGER, sessions INTEGER, tool_calls INTEGER""",
     "stats_daily_model_tokens": "date TEXT, model TEXT, tokens INTEGER",
+    # Cowork audit.jsonl: one row per Agent SDK `result` (a finished turn). Cost is per turn, not cumulative.
+    "cowork_turns": """
+        session_id TEXT, ts TEXT, ts_local TEXT, subtype TEXT, is_error INTEGER,
+        duration_ms INTEGER, duration_api_ms INTEGER, ttft_ms INTEGER, num_turns INTEGER,
+        total_cost_usd REAL, stop_reason TEXT, terminal_reason TEXT,
+        permission_denials INTEGER, origin TEXT""",
+    "rate_limit_events": """
+        session_id TEXT, ts TEXT, ts_local TEXT, status TEXT, rate_limit_type TEXT,
+        resets_at TEXT, using_overage INTEGER, overage_status TEXT""",
 }
+
+# Tables whose rows carry the app they came from.
+SOURCE_COL = {"sessions": "source", "agents": "source", "api_calls": "source", "tool_calls": "source",
+              "prompts": "app", "turns": "source", "compactions": "source"}
 
 SLASH_RE = re.compile(r"<command-name>/?([^<\s]+)</command-name>")
 # Leading tag -> prompt kind for harness-injected "user" turns (content itself is never stored).
@@ -205,6 +232,38 @@ def tool_meta(name: str, inp: dict):
     return "harness", None, None, None, 0
 
 
+def default_cowork_dir() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Claude"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Claude"
+    else:
+        base = Path.home() / ".config" / "Claude"
+    return base / "local-agent-mode-sessions"
+
+
+def long_path(p: Path) -> Path:
+    """Cowork paths nest past Windows' 260-char MAX_PATH; the extended-length prefix lifts it."""
+    if sys.platform != "win32":
+        return p
+    s = str(p.resolve())
+    return Path(s if s.startswith("\\\\?\\") else "\\\\?\\" + s)
+
+
+def ms_to_iso(ms):
+    if not isinstance(ms, (int, float)):
+        return None
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def project_dir_of(path: Path) -> Path:
+    """The projects/<encoded-cwd> directory a transcript sits under."""
+    for parent in path.parents:
+        if parent.parent.name == "projects":
+            return parent
+    return path.parent
+
+
 def file_ext(p):
     if not p:
         return None
@@ -213,9 +272,12 @@ def file_ext(p):
 
 
 class Extractor:
-    def __init__(self, claude_dir: Path, keep_titles: bool):
+    def __init__(self, claude_dir: Path, keep_titles: bool, cowork_dir: Path | None = None):
         self.root = claude_dir
+        self.cowork_dir = cowork_dir
         self.keep_titles = keep_titles
+        self.source = "claude_code"     # app of the files being read right now
+        self.cowork_project = {}        # Cowork session id -> project label from its metadata
         self.rows = defaultdict(list)
         self.sessions = {}
         self.agents = {}
@@ -227,7 +289,9 @@ class Extractor:
             s = self.sessions[sid] = dict(
                 session_id=sid, project=project, first_ts=None, last_ts=None,
                 active_ms=0, wall_ms=None, version=None, entrypoint=None,
-                git_branch=None, title=None, human_prompts=0, api_calls=0,
+                git_branch=None, title=None, source=self.source, session_type=None,
+                scheduled_task_id=None, archived=None, recorded_cost_usd=None,
+                human_prompts=0, api_calls=0,
                 tool_calls=0, subagent_count=0, compactions=0, est_cost_usd=0.0, last_process_cost_usd=None,
                 api_ms=None, tool_ms=None, lines_added=None, lines_removed=None)
         return s
@@ -265,6 +329,9 @@ class Extractor:
                     project = d["cwd"]
                 if not sid:
                     continue
+                if self.source == "cowork":
+                    # The transcript cwd is a throwaway VM path; use the folder the user picked.
+                    project = self.cowork_project.get(sid, "Cowork: no folder")
                 s = self.session(sid, project)
                 if not is_sub:
                     if project and not s["project"]:
@@ -364,6 +431,9 @@ class Extractor:
                     if kind == "other":
                         head = (raw or "").lstrip()
                         kind = next((k for tag, k in TAG_KINDS if head.startswith(tag)), "other")
+                        # The Cowork desktop UI sends typed prompts with no origin/promptSource.
+                        if kind == "other" and self.source == "cowork" and not is_sub:
+                            kind = "human"
                     self.rows["prompts"].append(dict(
                         session_id=sid, project=project, ts=ts, ts_local=local(ts),
                         kind=kind, source=src, chars=text_len(content),
@@ -434,16 +504,27 @@ class Extractor:
                     web_search=mu.get("webSearchRequests"), cost_usd=mu.get("costUSD")))
 
     # -- whole tree ----------------------------------------------------------
+    def process_files(self, files, label):
+        # main transcripts first so subagent rows can find their session's project
+        files = sorted(files, key=lambda p: ("subagents" in p.parts, str(p)))
+        for i, p in enumerate(files, 1):
+            self.process_file(p, project_dir_of(p))
+            if i % 100 == 0:
+                print(f"  {label}: {i}/{len(files)} transcripts", file=sys.stderr)
+        for table, col in SOURCE_COL.items():
+            for r in self.rows[table]:
+                r.setdefault(col, self.source)
+        for a in self.agents.values():
+            a.setdefault("source", self.source)
+
     def run(self):
         proj_root = self.root / "projects"
-        files = [p for p in proj_root.rglob("*.jsonl") if p.name != "journal.jsonl"]
-        # main transcripts first so subagent rows can find their session's project
-        files.sort(key=lambda p: ("subagents" in p.parts, str(p)))
-        for i, p in enumerate(files, 1):
-            project_dir = proj_root / p.relative_to(proj_root).parts[0]
-            self.process_file(p, project_dir)
-            if i % 50 == 0:
-                print(f"  {i}/{len(files)} transcripts", file=sys.stderr)
+        if proj_root.exists():
+            self.process_files([p for p in proj_root.rglob("*.jsonl") if p.name != "journal.jsonl"], "Claude Code")
+        if self.cowork_dir and self.cowork_dir.exists():
+            self.source = "cowork"
+            self.read_cowork(long_path(self.cowork_dir))
+            self.source = "claude_code"
         for s in self.sessions.values():
             s["wall_ms"] = ms_between(s["first_ts"], s["last_ts"])
         first_pr = {}
@@ -454,6 +535,80 @@ class Extractor:
         self.rows["agents"] = list(self.agents.values())
         self.read_history()
         self.read_stats_cache()
+
+    # -- Cowork ----------------------------------------------------------------
+    def read_cowork(self, root: Path):
+        """<account>/<org>/local_<id>.json is session metadata; <account>/<org>/<session>/
+        holds .claude/projects/**.jsonl transcripts and audit.jsonl."""
+        for meta_path in root.glob("*/*/local_*.json"):
+            try:
+                m = json.loads(meta_path.read_text(encoding="utf8"))
+            except (OSError, ValueError):
+                continue
+            # Allowlist: the same file holds the account email, the opening prompt and the
+            # system prompt, none of which are read.
+            sid = m.get("cliSessionId") or m.get("sessionId")
+            if not sid:
+                continue
+            folders = m.get("userSelectedFolders") or []
+            scheduled = m.get("sessionType") == "scheduled"
+            project = folders[0] if folders else ("Cowork: scheduled" if scheduled else "Cowork: no folder")
+            self.cowork_project[sid] = project
+            s = self.session(sid, project)
+            s.update(session_type=m.get("sessionType") or "interactive",
+                     scheduled_task_id=m.get("scheduledTaskId"), archived=int(bool(m.get("isArchived"))),
+                     first_ts=ms_to_iso(m.get("createdAt")), last_ts=ms_to_iso(m.get("lastActivityAt")),
+                     entrypoint="local-agent")
+            if self.keep_titles:
+                s["title"] = m.get("title")
+        self.process_files([p for p in root.glob("*/*/*/.claude/projects/**/*.jsonl")
+                            if p.name != "journal.jsonl"], "Cowork")
+        for audit in root.glob("*/*/*/audit.jsonl"):
+            self.read_cowork_audit(audit)
+
+    def read_cowork_audit(self, path: Path):
+        turn_ms, cost = defaultdict(int), defaultdict(float)
+        with path.open(encoding="utf8", errors="replace") as fh:
+            for line in fh:
+                # cheap prefilter: only `result` and rate-limit records are used
+                if '"type":"result"' not in line and '"rate_limit_event"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                t, sid = d.get("type"), d.get("session_id")
+                ts = d.get("timestamp") or d.get("_audit_timestamp")
+                if t == "result":
+                    # `result` (the reply text) is never read.
+                    origin = d.get("origin")
+                    self.rows["cowork_turns"].append(dict(
+                        session_id=sid, ts=ts, ts_local=local(ts), subtype=d.get("subtype"),
+                        is_error=int(bool(d.get("is_error"))), duration_ms=d.get("duration_ms"),
+                        duration_api_ms=d.get("duration_api_ms"), ttft_ms=d.get("ttft_ms"),
+                        num_turns=d.get("num_turns"), total_cost_usd=d.get("total_cost_usd"),
+                        stop_reason=d.get("stop_reason"), terminal_reason=d.get("terminal_reason"),
+                        permission_denials=len(d.get("permission_denials") or []),
+                        origin=origin.get("kind") if isinstance(origin, dict) else None))
+                    turn_ms[sid] += d.get("duration_ms") or 0
+                    cost[sid] += d.get("total_cost_usd") or 0
+                elif t == "rate_limit_event":
+                    info = d.get("rate_limit_info") or {}
+                    resets = info.get("resetsAt")
+                    if isinstance(resets, (int, float)):
+                        resets = ms_to_iso(resets * 1000 if resets < 1e11 else resets)
+                    self.rows["rate_limit_events"].append(dict(
+                        session_id=sid, ts=ts, ts_local=local(ts), status=info.get("status"),
+                        rate_limit_type=info.get("rateLimitType"), resets_at=resets,
+                        using_overage=int(bool(info.get("isUsingOverage"))),
+                        overage_status=info.get("overageStatus")))
+        for sid in turn_ms:
+            s = self.sessions.get(sid)
+            if s is None:
+                continue
+            # Cowork transcripts may lack turn_duration records; the SDK's own duration is authoritative.
+            s["active_ms"] = turn_ms[sid] or s["active_ms"]
+            s["recorded_cost_usd"] = (s["recorded_cost_usd"] or 0) + cost[sid]
 
     def read_history(self):
         hp = self.root / "history.jsonl"
@@ -517,9 +672,14 @@ def main():
     ap.add_argument("--claude-dir", type=Path, default=Path.home() / ".claude")
     ap.add_argument("--out", type=Path, default=Path(__file__).parent / "out")
     ap.add_argument("--no-titles", action="store_true", help="omit AI-generated session titles")
+    ap.add_argument("--cowork-dir", type=Path, default=default_cowork_dir(),
+                    help="Claude desktop local-agent-mode-sessions folder")
+    ap.add_argument("--no-cowork", action="store_true", help="skip Claude Cowork sessions")
     args = ap.parse_args()
-    ex = Extractor(args.claude_dir, keep_titles=not args.no_titles)
-    print(f"Reading {args.claude_dir} ...", file=sys.stderr)
+    cowork = None if args.no_cowork else args.cowork_dir
+    ex = Extractor(args.claude_dir, keep_titles=not args.no_titles, cowork_dir=cowork)
+    found = f" + {cowork}" if cowork and cowork.exists() else ""
+    print(f"Reading {args.claude_dir}{found} ...", file=sys.stderr)
     ex.run()
     db = write(ex.rows, args.out)
     print(f"Wrote {db}", file=sys.stderr)

@@ -1,6 +1,8 @@
 # claude-usage
 
-Extract usage metadata from your local Claude Code data (`~/.claude`) and Claude Cowork sessions, and view it as a self-contained HTML dashboard.
+**Covers both Claude Code and Claude Cowork.** Extract usage metadata from your local Claude Code data (`~/.claude`) and Claude Cowork sessions (the Claude desktop app's agent mode), and view it in one self-contained HTML dashboard. Filter by app, or compare them side by side.
+
+Most usage tools only read Claude Code's `~/.claude` folder. Cowork keeps its sessions elsewhere (see [Claude Cowork](#claude-cowork)), and this tool reads both.
 
 Records tokens, estimated cost, models, tools, latency, errors, subagents, compactions and activity timing. **Prompt and response text is never extracted.**
 

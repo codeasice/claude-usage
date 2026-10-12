@@ -4,6 +4,10 @@
 
 Most usage tools only read Claude Code's `~/.claude` folder. Cowork keeps its sessions elsewhere (see [Claude Cowork](#claude-cowork)), and this tool reads both.
 
+**[Live demo](https://codeasice.github.io/claude-usage/sample/dashboard_sample.html)** (randomly generated sample data)
+
+[![Dashboard screenshot, sample data](docs/screenshot.png)](https://codeasice.github.io/claude-usage/sample/dashboard_sample.html)
+
 Records tokens, estimated cost, models, tools, latency, errors, subagents, compactions and activity timing. **Prompt and response text is never extracted.**
 
 Python 3.10+ and the standard library are all you need: no dependencies, no network calls.

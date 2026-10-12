@@ -1,0 +1,9 @@
+# Extracted usage data and the built dashboard contain personal data. Never commit.
+out/
+*.sqlite
+*.csv
+dashboard.html
+
+__pycache__/
+*.pyc
+.venv/

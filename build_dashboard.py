@@ -18,7 +18,7 @@ from pathlib import Path
 from extract import PRICES
 
 HERE = Path(__file__).parent
-APPS = ["claude_code", "cowork"]   # row value = index; Claude Code first
+APPS = ["claude_code", "cowork", "cursor"]   # row value = index; Claude Code first
 MODEL_LABELS = {
     "claude-fable-5-1": "Fable 5.1", "claude-fable-5": "Fable 5", "claude-opus-5-5": "Opus 5.5",
     "claude-opus-5": "Opus 5", "claude-opus-4-8": "Opus 4.8", "claude-opus-4-7": "Opus 4.7",
@@ -58,7 +58,9 @@ def build(db_path: Path) -> dict:
 
     sess_project = {r["session_id"]: short_project(r["project"]) for r in q("select session_id, project from sessions")}
     first = [r[0] for r in q("""select min(d) from (select min(substr(ts_local,1,10)) d from api_calls
-                                  union all select min(substr(ts_local,1,10)) from history_prompts)""")]
+                                  union all select min(substr(ts_local,1,10)) from history_prompts
+                                  union all select min(substr(ts_local,1,10)) from prompts
+                                  union all select min(substr(ts_local,1,10)) from cursor_commits)""")]
     start = date.fromisoformat(first[0]) if first[0] else date.today()
     days = [(start + timedelta(n)).isoformat() for n in range((date.today() - start).days + 1)]
     day_ix = {d: i for i, d in enumerate(days)}
@@ -119,11 +121,16 @@ def build(db_path: Path) -> dict:
                 for r in q("""select ts_local, session_id, project from prompts
                               where app = 'cowork' and kind = 'human' and ts_local is not null""")
                 if r["ts_local"][:10] in day_ix]
+    history += [[day_ix[r["ts_local"][:10]], proj_of(r), int(r["ts_local"][11:13]), 2]
+                for r in q("""select ts_local, session_id, project from prompts
+                              where app = 'cursor' and kind = 'human' and ts_local is not null""")
+                if r["ts_local"][:10] in day_ix]
 
     compactions = [[day_ix.get(local_day(r["ts"]), 0), proj_of(r), 1 if r["agent_id"] else 0, r["pre_tokens"] or 0, app_of(r)]
                    for r in q("select * from compactions where ts is not null")]
 
     prs = {r["session_id"]: r["n"] for r in q("select session_id, count(*) n from pr_links group by 1")}
+    modes = Index()
     sessions = []
     for r in q("select * from sessions where first_ts is not null"):
         sessions.append([
@@ -131,7 +138,9 @@ def build(db_path: Path) -> dict:
             r["title"] or "", r["active_ms"] or 0, r["api_calls"], r["tool_calls"], r["subagent_count"],
             r["compactions"], prs.get(r["session_id"], 0), round(r["est_cost_usd"] or 0, 2), r["human_prompts"],
             app_of(r), 1 if r["session_type"] == "scheduled" else 0,
-            round(r["recorded_cost_usd"], 2) if r["recorded_cost_usd"] is not None else -1])
+            round(r["recorded_cost_usd"], 2) if r["recorded_cost_usd"] is not None else -1,
+            modes(r["session_type"] or "unknown") if r["source"] == "cursor" else -1,
+            r["lines_added"] or 0, r["lines_removed"] or 0])
 
     # Cowork audit data: one row per finished turn, and rate-limit status events.
     sess_type = {r["session_id"]: r["session_type"] for r in q("select session_id, session_type from sessions")}
@@ -148,10 +157,31 @@ def build(db_path: Path) -> dict:
                                  where e.ts_local is not null""")
                    if r["ts_local"][:10] in day_ix]
 
+    # Cursor: assistant messages (no cost), AI-tracked commits, and optional billed usage CSVs.
+    cm_rows = q("select model, count(*) n from cursor_messages group by 1 order by n desc")
+    cmodels = [r["model"] or "unknown" for r in cm_rows]
+    if len(cmodels) > 8:
+        cmodels = cmodels[:7] + ["Other"]
+    cm_ix = {m: i for i, m in enumerate(cmodels)}
+    cursor_msgs = [[day_ix[r["ts_local"][:10]], proj_of(r), r["is_sidechain"], cm_ix.get(r["model"] or "unknown", len(cmodels) - 1),
+                    int(r["ts_local"][11:13]), r["has_tool"]]
+                   for r in q("select * from cursor_messages where ts_local is not null") if r["ts_local"][:10] in day_ix]
+    cursor_commits = [[day_ix[r["ts_local"][:10]], r["lines_added"] or 0, r["composer_lines_added"] or 0,
+                       r["tab_lines_added"] or 0, r["human_lines_added"] or 0, r["lines_deleted"] or 0]
+                      for r in q("select * from cursor_commits where ts_local is not null") if r["ts_local"][:10] in day_ix]
+    umodel = Index()
+    cursor_usage = [[day_ix[r["ts_local"][:10]], umodel(r["model"] or "unknown"),
+                     (r["total_tokens"] if r["total_tokens"] is not None else
+                      (r["input_tokens"] or 0) + (r["output_tokens"] or 0) + (r["cache_read_tokens"] or 0) + (r["cache_write_tokens"] or 0)),
+                     round(r["cost_usd"] or 0, 5)]
+                    for r in q("select * from cursor_usage where ts_local is not null") if r["ts_local"][:10] in day_ix]
+
     return dict(built=datetime.now().strftime("%Y-%m-%d %H:%M"), days=days, projects=proj.items,
                 models=models, tools=tool.items, details=detail.items, files=files.items,
                 calls=calls, toolcalls=toolcalls, history=history, compactions=compactions,
-                sessions=sessions, cwTurns=cw_turns, rateLimits=rate_limits, limitLabels=limit_types.items)
+                sessions=sessions, cwTurns=cw_turns, rateLimits=rate_limits, limitLabels=limit_types.items,
+                cursorModels=cmodels, cursorMsgs=cursor_msgs, cursorModes=modes.items, cursorCommits=cursor_commits,
+                cursorUsage=cursor_usage, cursorUsageModels=umodel.items)
 
 
 def local_day(ts: str) -> str:

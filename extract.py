@@ -1,4 +1,4 @@
-"""Extract Claude Code and Claude Cowork usage metadata into SQLite + CSV.
+"""Extract Claude Code, Claude Cowork and Cursor usage metadata into SQLite + CSV.
 
 Sources:
     Claude Code  ~/.claude (projects/**.jsonl, history.jsonl, stats-cache.json)
@@ -6,6 +6,10 @@ Sources:
                  %APPDATA%/Claude, macOS: ~/Library/Application Support/Claude).
                  Each Cowork session holds Claude Code-format transcripts plus an
                  Agent SDK audit.jsonl, of which only numeric/status fields are read.
+    Cursor       User/globalStorage/state.vscdb (conversation headers, message
+                 type/model/time/length, tool names; never ItemTable or message
+                 text) and ~/.cursor/ai-tracking/ai-code-tracking.db (per-commit
+                 line counts). Optional billed usage from cursor.com CSV exports.
 
 Deliberately excludes the *content* of prompts, replies, thinking, and tool
 inputs/outputs. What is kept: timestamps, sizes, token counts, costs, models,
@@ -18,6 +22,8 @@ Usage:
     python extract.py --no-titles           # also drop the AI-generated session titles
     python extract.py --no-cowork           # Claude Code only
     python extract.py --cowork-dir PATH     # non-default Cowork location
+    python extract.py --no-cursor           # skip Cursor
+    python extract.py --cursor-usage-csv F  # add Cursor billed usage (repeatable)
 
 Stdlib only. Full rebuild every run (no incremental state).
 """
@@ -33,7 +39,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 SCHEMA = {
     "sessions": """
@@ -96,6 +102,23 @@ SCHEMA = {
     "rate_limit_events": """
         session_id TEXT, ts TEXT, ts_local TEXT, status TEXT, rate_limit_type TEXT,
         resets_at TEXT, using_overage INTEGER, overage_status TEXT""",
+    # Cursor: one row per assistant message. Token counts are only recorded for some messages
+    # (none after early 2026), so no cost is estimated from them.
+    "cursor_messages": """
+        session_id TEXT, agent_id TEXT, is_sidechain INTEGER, project TEXT, ts TEXT, ts_local TEXT,
+        model TEXT, input_tokens INTEGER, output_tokens INTEGER, has_tool INTEGER,
+        thinking_ms INTEGER""",
+    # Cursor's AI code tracking: lines per commit by author (tab completion, agent, human).
+    "cursor_commits": """
+        commit_hash TEXT, ts TEXT, ts_local TEXT, branch TEXT, lines_added INTEGER,
+        lines_deleted INTEGER, tab_lines_added INTEGER, tab_lines_deleted INTEGER,
+        composer_lines_added INTEGER, composer_lines_deleted INTEGER, human_lines_added INTEGER,
+        human_lines_deleted INTEGER, ai_pct REAL""",
+    # Cursor billing, from usage CSVs exported at cursor.com/dashboard (optional).
+    "cursor_usage": """
+        ts TEXT, ts_local TEXT, kind TEXT, model TEXT, max_mode TEXT, input_tokens INTEGER,
+        cache_write_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER,
+        total_tokens INTEGER, cost_usd REAL""",
 }
 
 # Tables whose rows carry the app they came from.
@@ -271,10 +294,188 @@ def file_ext(p):
     return suf or Path(p).name
 
 
+def default_cursor_dir() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Cursor"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Cursor"
+    return Path.home() / ".config" / "Cursor"
+
+
+def open_sqlite_ro(path: Path) -> sqlite3.Connection:
+    """Read-only; sees the live WAL when Cursor is running. Falls back to the main file alone."""
+    uri = "file:" + str(path).replace("\\", "/")
+    try:
+        db = sqlite3.connect(uri + "?mode=ro", uri=True)
+        db.execute("select 1 from sqlite_master limit 1")
+        return db
+    except sqlite3.Error:
+        return sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True)
+
+
+def uri_to_path(uri: str | None) -> str | None:
+    """'file:///c%3A/Users/x/proj' -> 'c:/Users/x/proj'. Non-file URIs are kept as-is."""
+    if not uri:
+        return None
+    u = urlparse(uri)
+    if u.scheme != "file":
+        return uri
+    p = unquote(u.path)
+    return p[1:] if re.match(r"^/[A-Za-z]:", p) else p
+
+
+# Cursor tool name (minus any _v2 suffix) -> (Claude Code-style name, category). Shared names let
+# the tool, shell and file charts compare apps; the app filter separates them again.
+CURSOR_TOOLS = {
+    "read_file": ("Read", "file"), "edit_file": ("Edit", "file"), "search_replace": ("Edit", "file"),
+    "write": ("Write", "file"), "delete_file": ("Delete", "file"),
+    "run_terminal_command": ("Bash", "shell"), "run_terminal_cmd": ("Bash", "shell"),
+    "grep": ("Grep", "search"), "ripgrep_raw_search": ("Grep", "search"), "glob_file_search": ("Glob", "search"),
+    "list_dir": ("LS", "search"), "codebase_search": ("SemanticSearch", "search"),
+    "semantic_search_full": ("SemanticSearch", "search"), "web_search": ("WebSearch", "web"),
+    "web_fetch": ("WebFetch", "web"), "todo_write": ("TodoWrite", "harness"), "task": ("Agent", "agent"),
+    "read_lints": ("ReadLints", "harness"), "ask_question": ("AskUserQuestion", "harness"),
+}
+
+
+def cursor_mcp(name: str, known: set):
+    """Cursor spells MCP tools several ways: 'mcp_<server>_<tool>', 'mcp-<server>-<server>-<tool>',
+    'mcp-<server>-user-<server>-<tool>' and 'mcp-<server>-<tool>'. Returns (server, tool, certain);
+    the last form is ambiguous when the server name has dashes, so `known` (servers seen in the
+    unambiguous forms) is tried first."""
+    rest = re.sub(r"::[^-]*", "", name[4:])      # drop scope blobs like '::mcpScope:profile:...'
+    if name.startswith("mcp_"):
+        server, _, tool = rest.partition("_")
+        return server.removeprefix("user-"), tool, True
+    m = re.match(r"^(.+?)-(?:user-)?\1-(.+)$", rest)
+    if m:
+        known.add(m.group(1))
+        return m.group(1), m.group(2), True
+    rest = rest.removeprefix("user-")
+    for k in sorted(known, key=len, reverse=True):
+        if rest.startswith(k + "-"):
+            return k, rest[len(k) + 1:], True
+    server, _, tool = rest.rpartition("-")
+    return server or None, tool or None, False
+
+
+def cursor_project(p: str | None) -> str | None:
+    """Uppercase the drive letter, and map Cursor's own '~/.cursor/projects/c-Users-me-dev-repo'
+    folders back to the real path (dashes are ambiguous, so the path is matched on disk)."""
+    if not p:
+        return None
+    p = re.sub(r"^([a-z]):", lambda m: m.group(1).upper() + ":", p)
+    m = re.search(r"[\\/]\.cursor[\\/]projects[\\/]([^\\/]+)$", p)
+    if not m:
+        return p
+    parts = m.group(1).split("-")
+    if len(parts[0]) == 1:      # drive letter
+        cur, parts = Path(parts[0].upper() + ":\\"), parts[1:]
+    else:
+        cur = Path("/")
+    while parts:
+        for n in range(len(parts), 0, -1):     # longest existing child wins
+            name = "-".join(parts[:n])
+            # 'x-code-workspace' is the multi-root workspace file 'x.code-workspace'
+            cand = next((c for c in (cur / name, cur / re.sub(r"-code-workspace$", ".code-workspace", name))
+                         if c.exists()), None)
+            if cand:
+                cur, parts = cand, parts[n:]
+                break
+        else:
+            return p
+    return str(cur)
+
+
+def cursor_tool_meta(name: str, params: dict, project: str | None, known_mcp: set):
+    """Return (tool, category, mcp_server, detail, file_path, background)."""
+    if name.startswith(("mcp_", "mcp-")):
+        server, tool, _ = cursor_mcp(name, known_mcp)
+        if not server:
+            return "mcp", "mcp", None, None, None, 0
+        return f"mcp__{server}__{tool}", "mcp", server, tool, None, 0
+    base = re.sub(r"_v\d+$", "", name)
+    tool, cat = CURSOR_TOOLS.get(base, (base, "harness"))
+    p = params if isinstance(params, dict) else {}
+    bg = 1 if p.get("isBackground") or p.get("is_background") else 0
+    if cat == "shell":
+        return tool, cat, None, bash_program(p.get("command") or ""), None, bg
+    if cat == "file":
+        fp = p.get("targetFile") or p.get("target_file") or p.get("relativeWorkspacePath")
+        if fp and project and not re.match(r"^([A-Za-z]:)?[\\/]", fp):
+            fp = project.rstrip("/\\") + "/" + fp
+        return tool, cat, None, None, fp, 0
+    if cat == "search":
+        return tool, cat, None, None, p.get("path") or p.get("targetDirectory"), 0
+    if cat == "agent":
+        return tool, cat, None, p.get("subagentType") or "general-purpose", None, 0
+    if tool == "WebFetch":
+        return tool, cat, None, urlparse(p.get("url") or "").netloc or None, None, 0
+    return tool, cat, None, None, None, 0
+
+
+def num(v):
+    """'$1,234.50' / '1234' / 'Included' -> float or None."""
+    if v is None:
+        return None
+    s = re.sub(r"[$,\s]", "", str(v))
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def read_cursor_usage_csv(path: Path) -> list[dict]:
+    """Best effort: column names are matched loosely, since Cursor's export format has changed over time."""
+    rows = []
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        rd = csv.DictReader(fh)
+        heads = {h: re.sub(r"[^a-z]", "", h.lower()) for h in rd.fieldnames or []}
+
+        def col(*keys, exclude=()):
+            for h, k in heads.items():
+                if any(x in k for x in keys) and not any(x in k for x in exclude):
+                    return h
+            return None
+        c_date, c_kind, c_model = col("date", "time"), col("kind", "type"), col("model")
+        c_max = col("maxmode")
+        c_inw = col("inputwcache", "inputwithcache", exclude=("wo", "without"))
+        c_in = col("inputwocache", "inputwithoutcache") or (None if c_inw else col("input"))
+        c_cr = col("cacheread")
+        c_out = col("output")
+        c_tot = col("totaltokens", "tokens", exclude=("input", "output", "cache"))
+        c_cost = col("cost", "charged", "amount")
+        for r in rd:
+            ts_raw = (r.get(c_date) or "").strip() if c_date else ""
+            ts = None
+            for fmt in (None, "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M %p", "%b %d, %Y, %I:%M %p", "%Y-%m-%d"):
+                try:
+                    dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")) if fmt is None else datetime.strptime(ts_raw, fmt)
+                except ValueError:
+                    continue
+                ts = (dt if dt.tzinfo else dt.astimezone()).astimezone(timezone.utc).isoformat()
+                break
+            if ts is None:
+                continue
+            inw, inp = num(r.get(c_inw)) if c_inw else None, num(r.get(c_in)) if c_in else None
+            rows.append(dict(
+                ts=ts, ts_local=local(ts), kind=r.get(c_kind) if c_kind else None,
+                model=r.get(c_model) if c_model else None, max_mode=r.get(c_max) if c_max else None,
+                input_tokens=int(inp or 0), cache_write_tokens=int(max((inw or 0) - (inp or 0), 0)),
+                cache_read_tokens=int(num(r.get(c_cr)) or 0) if c_cr else 0,
+                output_tokens=int(num(r.get(c_out)) or 0) if c_out else 0,
+                total_tokens=int(num(r.get(c_tot)) or 0) if c_tot else None,
+                cost_usd=num(r.get(c_cost)) if c_cost else None))
+    return rows
+
+
 class Extractor:
-    def __init__(self, claude_dir: Path, keep_titles: bool, cowork_dir: Path | None = None):
+    def __init__(self, claude_dir: Path, keep_titles: bool, cowork_dir: Path | None = None,
+                 cursor_dir: Path | None = None, cursor_csvs: list[Path] | None = None):
         self.root = claude_dir
         self.cowork_dir = cowork_dir
+        self.cursor_dir = cursor_dir
+        self.cursor_csvs = cursor_csvs or []
         self.keep_titles = keep_titles
         self.source = "claude_code"     # app of the files being read right now
         self.cowork_project = {}        # Cowork session id -> project label from its metadata
@@ -525,6 +726,12 @@ class Extractor:
             self.source = "cowork"
             self.read_cowork(long_path(self.cowork_dir))
             self.source = "claude_code"
+        if self.cursor_dir and (self.cursor_dir / "User" / "globalStorage" / "state.vscdb").exists():
+            self.source = "cursor"
+            self.read_cursor(self.cursor_dir)
+            self.source = "claude_code"
+        for p in self.cursor_csvs:
+            self.rows["cursor_usage"].extend(read_cursor_usage_csv(p))
         for s in self.sessions.values():
             s["wall_ms"] = ms_between(s["first_ts"], s["last_ts"])
         first_pr = {}
@@ -610,6 +817,203 @@ class Extractor:
             s["active_ms"] = turn_ms[sid] or s["active_ms"]
             s["recorded_cost_usd"] = (s["recorded_cost_usd"] or 0) + cost[sid]
 
+    # -- Cursor ----------------------------------------------------------------
+    def read_cursor(self, root: Path):
+        """User/globalStorage/state.vscdb holds conversations ("composers") and their messages
+        ("bubbles") as JSON in a key-value table. Only an allowlist of fields is read: the message
+        text, thinking, tool params and tool results are never stored (tool params are reduced to
+        the same metadata as Claude Code's: program name, file path, domain)."""
+        db = open_sqlite_ro(root / "User" / "globalStorage" / "state.vscdb")
+        ws_folder = {}
+        for wj in (root / "User" / "workspaceStorage").glob("*/workspace.json"):
+            try:
+                ws_folder[wj.parent.name] = uri_to_path(json.loads(wj.read_text(encoding="utf8")).get("folder"))
+            except (OSError, ValueError):
+                pass
+
+        comp = {}   # composer id -> merged allowlisted metadata
+        tables = {r[0] for r in db.execute("select name from sqlite_master where type='table'")}
+
+        def merge(cid, o, ws_id=None):
+            c = comp.setdefault(cid, {})
+            wi = o.get("workspaceIdentifier") or {}
+            uri = wi.get("uri") if isinstance(wi.get("uri"), dict) else {}
+            folder = cursor_project(uri.get("fsPath") or uri_to_path(uri.get("external")) or ws_folder.get(ws_id or wi.get("id")))
+            si = o.get("subagentInfo") if isinstance(o.get("subagentInfo"), dict) else {}
+            for k, v in dict(
+                    created=o.get("createdAt"), updated=o.get("lastUpdatedAt"), title=o.get("name"),
+                    mode=o.get("unifiedMode"), project=folder, archived=o.get("isArchived"),
+                    lines_added=o.get("totalLinesAdded"), lines_removed=o.get("totalLinesRemoved"),
+                    model=(o.get("modelConfig") or {}).get("modelName") if isinstance(o.get("modelConfig"), dict) else None,
+                    parent=si.get("parentComposerId"),
+                    agent_type=si.get("subagentTypeName") or si.get("subagentType")).items():
+                if v is not None and c.get(k) is None:
+                    c[k] = v
+
+        if "composerHeaders" in tables:
+            for cid, ws_id, created, updated, archived, v in db.execute(
+                    "select composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, value from composerHeaders"):
+                try:
+                    o = json.loads(v) if v else {}
+                except ValueError:
+                    o = {}
+                o.setdefault("createdAt", created)
+                o.setdefault("lastUpdatedAt", updated)
+                o.setdefault("isArchived", archived)
+                merge(cid, o, ws_id)
+        for k, v in db.execute("select key, value from cursorDiskKV where key like 'composerData:%'"):
+            try:
+                merge(k.split(":", 1)[1], json.loads(v))
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+        def root_of(cid):
+            seen = set()
+            while comp.get(cid, {}).get("parent") and cid not in seen:
+                seen.add(cid)
+                cid = comp[cid]["parent"]
+            return cid
+
+        def session_for(cid, ts=None):
+            sid = root_of(cid)
+            c = comp.get(sid, {})
+            s = self.session(sid, c.get("project") or "Cursor: no folder")
+            if s["entrypoint"] is None:
+                s.update(entrypoint="cursor", session_type=c.get("mode"),
+                         archived=int(bool(c.get("archived"))), lines_added=c.get("lines_added"),
+                         lines_removed=c.get("lines_removed"),
+                         first_ts=ms_to_iso(c.get("created")), last_ts=ms_to_iso(c.get("updated")))
+                if self.keep_titles:
+                    s["title"] = c.get("title")
+            if ts:
+                s["first_ts"] = min(filter(None, [s["first_ts"], ts]))
+                s["last_ts"] = max(filter(None, [s["last_ts"], ts]))
+            return s
+
+        for cid, c in comp.items():
+            if not c.get("parent"):
+                session_for(cid)
+
+        n = 0
+        used = set()        # sessions with at least one message; the rest are empty drafts
+        known_mcp = {"cursor-ide-browser"}
+        mcp_rows = []
+        for k, v in db.execute("select key, value from cursorDiskKV where key like 'bubbleId:%'"):
+            n += 1
+            if n % 10000 == 0:
+                print(f"  Cursor: {n:,} messages", file=sys.stderr)
+            parts = k.split(":")
+            if len(parts) < 3:
+                continue
+            try:
+                o = json.loads(v)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(o, dict):
+                continue
+            cid = parts[1]
+            c = comp.get(cid, {})
+            is_sub = bool(c.get("parent"))
+            agent_id = cid if is_sub else None
+            ts = o.get("createdAt") if isinstance(o.get("createdAt"), str) else ms_to_iso(o.get("createdAt"))
+            s = session_for(cid, None if is_sub else ts)
+            sid, project = s["session_id"], s["project"]
+            if s["project"] == "Cursor: no folder" and o.get("workspaceProjectDir"):
+                s["project"] = project = cursor_project(o["workspaceProjectDir"])
+            used.add(sid)
+            if is_sub and (sid, agent_id) not in self.agents:
+                self.agents[(sid, agent_id)] = dict(
+                    agent_id=agent_id, session_id=sid, agent_type=c.get("agent_type"), workflow_id=None,
+                    first_ts=None, last_ts=None, api_calls=0, tool_calls=0)
+                s["subagent_count"] += 1
+            if is_sub and ts:
+                a = self.agents[(sid, agent_id)]
+                a["first_ts"] = min(filter(None, [a["first_ts"], ts]))
+                a["last_ts"] = max(filter(None, [a["last_ts"], ts]))
+
+            if o.get("type") == 1:      # user message
+                if o.get("isSimulatedMsg"):
+                    kind = "simulated"
+                elif o.get("isNudge"):
+                    kind = "nudge"
+                else:
+                    kind = "subagent_task" if is_sub else "human"
+                self.rows["prompts"].append(dict(
+                    session_id=sid, project=project, ts=ts, ts_local=local(ts), kind=kind, source=None,
+                    chars=len(o.get("text") or ""), slash_command=None, permission_mode=o.get("unifiedMode")))
+                if kind == "human":
+                    s["human_prompts"] += 1
+                continue
+
+            tc = o.get("tokenCount") if isinstance(o.get("tokenCount"), dict) else {}
+            mi = o.get("modelInfo") if isinstance(o.get("modelInfo"), dict) else {}
+            tf = o.get("toolFormerData") if isinstance(o.get("toolFormerData"), dict) else {}
+            self.rows["cursor_messages"].append(dict(
+                session_id=sid, agent_id=agent_id, is_sidechain=int(is_sub), project=project, ts=ts,
+                ts_local=local(ts), model=mi.get("modelName") or c.get("model"),
+                input_tokens=tc.get("inputTokens") or 0, output_tokens=tc.get("outputTokens") or 0,
+                has_tool=int(bool(tf.get("name"))), thinking_ms=o.get("thinkingDurationMs")))
+            if o.get("turnDurationMs") and not is_sub:
+                self.rows["turns"].append(dict(session_id=sid, project=project, ts=ts, ts_local=local(ts),
+                                               duration_ms=o["turnDurationMs"], message_count=None))
+                s["active_ms"] += o["turnDurationMs"]
+            if tf.get("name"):
+                params = tf.get("params") if tf.get("params") is not None else tf.get("rawArgs")
+                if isinstance(params, str):
+                    try:
+                        params = json.loads(params)
+                    except ValueError:
+                        params = {}
+                tool, cat, srv, detail, fpath, bg = cursor_tool_meta(tf["name"], params, project, known_mcp)
+                status = tf.get("status")
+                if cat == "mcp":
+                    mcp_rows.append((len(self.rows["tool_calls"]), tf["name"]))
+                self.rows["tool_calls"].append(dict(
+                    tool_use_id=tf.get("toolCallId"), message_id=parts[2], session_id=sid, agent_id=agent_id,
+                    is_sidechain=int(is_sub), project=project, ts=ts, ts_local=local(ts), tool=tool,
+                    category=cat, mcp_server=srv, detail=detail, file_path=fpath, file_ext=file_ext(fpath),
+                    background=bg, result_ts=None, latency_ms=None, is_error=int(status == "error"),
+                    denied="rejected" if tf.get("userDecision") == "rejected" else None,
+                    interrupted=int(status == "cancelled"), result_chars=None, input_chars=None))
+                s["tool_calls"] += 1
+                if is_sub:
+                    self.agents[(sid, agent_id)]["tool_calls"] += 1
+        db.close()
+        for i, name in mcp_rows:     # re-resolve now that every unambiguous server name is known
+            tool, _, srv, detail, _, _ = cursor_tool_meta(name, {}, None, known_mcp)
+            self.rows["tool_calls"][i].update(tool=tool, mcp_server=srv, detail=detail)
+        for sid in [sid for sid, s in self.sessions.items() if s["source"] == "cursor" and sid not in used]:
+            del self.sessions[sid]
+        self.read_cursor_commits(Path.home() / ".cursor" / "ai-tracking" / "ai-code-tracking.db")
+        for table, col in SOURCE_COL.items():
+            for r in self.rows[table]:
+                r.setdefault(col, self.source)
+        for a in self.agents.values():
+            a.setdefault("source", self.source)
+
+    def read_cursor_commits(self, path: Path):
+        if not path.exists():
+            return
+        db = open_sqlite_ro(path)
+        try:
+            rows = db.execute("""select commitHash, commitDate, scoredAt, branchName, linesAdded, linesDeleted,
+                tabLinesAdded, tabLinesDeleted, composerLinesAdded, composerLinesDeleted, humanLinesAdded,
+                humanLinesDeleted, v2AiPercentage from scored_commits""").fetchall()
+        except sqlite3.Error:
+            rows = []
+        db.close()
+        for (h, cdate, scored, branch, la, ld, tla, tld, cla, cld, hla, hld, ai) in rows:
+            ts = None
+            try:
+                ts = datetime.strptime(cdate or "", "%a %b %d %H:%M:%S %Y %z").astimezone(timezone.utc).isoformat()
+            except ValueError:
+                ts = ms_to_iso(scored)
+            self.rows["cursor_commits"].append(dict(
+                commit_hash=h, ts=ts, ts_local=local(ts), branch=branch, lines_added=la, lines_deleted=ld,
+                tab_lines_added=tla, tab_lines_deleted=tld, composer_lines_added=cla,
+                composer_lines_deleted=cld, human_lines_added=hla, human_lines_deleted=hld,
+                ai_pct=num(ai)))
+
     def read_history(self):
         hp = self.root / "history.jsonl"
         if not hp.exists():
@@ -675,10 +1079,18 @@ def main():
     ap.add_argument("--cowork-dir", type=Path, default=default_cowork_dir(),
                     help="Claude desktop local-agent-mode-sessions folder")
     ap.add_argument("--no-cowork", action="store_true", help="skip Claude Cowork sessions")
+    ap.add_argument("--cursor-dir", type=Path, default=default_cursor_dir(),
+                    help="Cursor's user data folder (the one containing User/globalStorage)")
+    ap.add_argument("--no-cursor", action="store_true", help="skip Cursor")
+    ap.add_argument("--cursor-usage-csv", type=Path, action="append", default=[], metavar="CSV",
+                    help="usage CSV exported from cursor.com/dashboard (repeatable)")
     args = ap.parse_args()
     cowork = None if args.no_cowork else args.cowork_dir
-    ex = Extractor(args.claude_dir, keep_titles=not args.no_titles, cowork_dir=cowork)
+    cursor = None if args.no_cursor else args.cursor_dir
+    ex = Extractor(args.claude_dir, keep_titles=not args.no_titles, cowork_dir=cowork,
+                   cursor_dir=cursor, cursor_csvs=args.cursor_usage_csv)
     found = f" + {cowork}" if cowork and cowork.exists() else ""
+    found += f" + {cursor}" if cursor and cursor.exists() else ""
     print(f"Reading {args.claude_dir}{found} ...", file=sys.stderr)
     ex.run()
     db = write(ex.rows, args.out)

@@ -98,6 +98,7 @@ td.wrap { white-space: normal; min-width: 220px; }
 #tip .r b { font-weight: 600; color: var(--text-primary); min-width: 54px; }
 #tip .r i { width: 12px; height: 2px; border-radius: 1px; display: inline-block; }
 #tip .r span { color: var(--text-secondary); }
+[hidden] { display: none !important; }
 .empty { color: var(--text-muted); padding: 24px 0; text-align: center; }
 @media (max-width: 1100px) {
   .kpis, .kpis2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -117,7 +118,7 @@ td.wrap { white-space: normal; min-width: 220px; }
       <button data-v="90">90 days</button><button data-v="all">All</button>
     </div>
     <div class="seg" id="app" role="group" aria-label="App">
-      <button data-v="all">All apps</button><button data-v="0">Claude Code</button><button data-v="1">Cowork</button>
+      <button data-v="all">All apps</button><button data-v="0">Claude Code</button><button data-v="1">Cowork</button><button data-v="2">Cursor</button>
     </div>
     <label>Project <select id="proj"></select></label>
     <div class="seg" id="thread" role="group" aria-label="Thread">
@@ -167,6 +168,20 @@ td.wrap { white-space: normal; min-width: 220px; }
       <div class="card" id="c-cw-rate"></div>
     </div>
   </section>
+  <section id="cursor">
+    <h2 class="section">Cursor</h2>
+    <p class="sub">From Cursor's local conversation store and its AI code tracking. Cursor bills server-side and keeps no cost locally, so Cursor is left out of the cost charts above unless you add a usage CSV. Date range and project filters apply.</p>
+    <div class="kpis2" id="kpis4"></div>
+    <div class="grid one"><div class="card" id="c-cu-daily"></div></div>
+    <div class="grid">
+      <div class="card" id="c-cu-models"></div>
+      <div class="card" id="c-cu-modes"></div>
+    </div>
+    <div class="grid">
+      <div class="card" id="c-cu-lines"></div>
+      <div class="card" id="c-cu-usage"></div>
+    </div>
+  </section>
   <div id="tip" role="tooltip"></div>
 </div>
 
@@ -179,7 +194,14 @@ const OTHER = "var(--axis)";
 const NS = "http://www.w3.org/2000/svg";
 const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const state = { range: "30", proj: -1, thread: "all", app: "all" };
-const APP_NAMES = ["Claude Code", "Cowork"];
+const APP_NAMES = ["Claude Code", "Cowork", "Cursor"];
+// Cursor only appears when its data was extracted: no button, section or mentions otherwise.
+const HAS_CURSOR = (D.cursorMsgs || []).length > 0;
+if (HAS_CURSOR) {
+  const h1 = document.querySelector("h1").firstChild;
+  h1.textContent = h1.textContent.replace(/^Claude (u)sage/i, "Claude + Cursor $1sage");
+  document.title = document.title.replace(/^Claude (u)sage/i, "Claude + Cursor $1sage");
+} else document.querySelector('#app button[data-v="2"]').remove();
 
 // ---------- formatting ----------
 const compact = n => {
@@ -509,10 +531,12 @@ function render() {
   const prompts = hist.length;
   document.getElementById("kpis2").replaceChildren(
     tile("Your prompts", intf(prompts), `${(prompts / Math.max(1, sess.length)).toFixed(1)} per session`),
-    tile("Tool calls", intf(tools.length), `${(tools.length / Math.max(1, calls.length)).toFixed(2)} per API call`),
+    tile("Tool calls", intf(tools.length), calls.length ? `${(tools.length / calls.length).toFixed(2)} per API call` : ""),
     tile("Tool error rate", pct(errs / Math.max(1, tools.length)), `${intf(errs)} failed calls`),
-    tile("Auto-compactions", intf(comps.length), comps.length ? `avg ${compact(sum(comps, r => r[3]) / comps.length)} tokens before` : ""),
-    tile("MRs/PRs linked", intf(sum(sess, r => r[9])), `across ${sess.filter(r => r[9]).length} sessions`));
+    // Cursor records neither compactions nor linked MRs.
+    ...(state.app === "2" ? [] : [
+      tile("Auto-compactions", intf(comps.length), comps.length ? `avg ${compact(sum(comps, r => r[3]) / comps.length)} tokens before` : ""),
+      tile("MRs/PRs linked", intf(sum(sess, r => r[9])), `across ${sess.filter(r => r[9]).length} sessions`)]));
 
   // Daily cost by model
   const d0 = Math.max(s0, firstCallDay === Infinity ? s0 : firstCallDay);
@@ -532,18 +556,25 @@ function render() {
       {numeric: modelSeries.map((_, i) => i + 1).concat(modelSeries.length + 1)});
   } else c.append(el("div", {class: "empty"}, "No API calls in this slice"));
 
-  // Claude Code vs Cowork (fixed colors per app, so filtering never repaints)
+  // Cost per app (fixed colors per app, so filtering never repaints). Cursor has no local cost;
+  // it only appears when a billed-usage CSV was imported, and then it's billed, not estimated.
   c = document.getElementById("c-app");
-  cardHeader(c, "Claude Code vs Cowork", "Daily estimated cost per app.");
+  const cuUsage = D.cursorUsage || [];
+  const cuBilled = state.proj >= 0 ? [] : cuUsage.filter(r => keep(r[0], -1, null, 2));
+  cardHeader(c, "Cost per app", "Daily estimated cost per app." + (HAS_CURSOR ? (cuUsage.length
+    ? " Cursor is its billed cost from the usage CSV (not split by project)." : " Cursor is not shown: it keeps no cost data locally.") : ""));
   const appV = APP_NAMES.map(() => new Array(dayLabels.length).fill(0));
   for (const r of calls) if (r[0] >= d0) appV[r[14]][r[0] - d0] += cost(r);
+  for (const r of cuBilled) if (r[0] >= d0) appV[2][r[0] - d0] += r[3];
   const appSeries = APP_NAMES.map((name, i) => ({name, color: SERIES[i], values: appV[i], i}))
-    .filter(s => state.app === "all" || s.i === Number(state.app));
+    .filter(s => state.app === "all" || s.i === Number(state.app))
+    .filter(s => s.i !== 2 || cuUsage.length);
   legend(c, appSeries, true);
   if (dayLabels.length > 1) lineChart(c, {labels: dayLabels, series: appSeries, fmt: usd, tickFmt: usdTick});
   tableView(c, ["App", "Cost", "API calls", "Sessions", "Your prompts"], appSeries.map(s => {
     const rs = calls.filter(r => r[14] === s.i), n = sess.filter(r => r[12] === s.i).length, pr = hist.filter(r => r[3] === s.i).length;
-    return [s.name, {display: usd(sum(rs, cost)), sort: sum(rs, cost)}, {display: intf(rs.length), sort: rs.length}, {display: intf(n), sort: n}, {display: intf(pr), sort: pr}];
+    const cst = s.i === 2 ? sum(cuBilled, r => r[3]) : sum(rs, cost);
+    return [s.name, {display: usd(cst), sort: cst}, {display: s.i === 2 ? "–" : intf(rs.length), sort: rs.length}, {display: intf(n), sort: n}, {display: intf(pr), sort: pr}];
   }), {numeric: [1, 2, 3, 4]});
 
   // Cost by token type
@@ -644,7 +675,7 @@ function render() {
 
   // Long-run prompt history (weekly)
   c = document.getElementById("c-history");
-  cardHeader(c, "Prompts per week", "Claude Code prompts come from your prompt history, which goes back further than the transcripts (those are pruned after ~30 days by default). Cowork prompts come from its transcripts.");
+  cardHeader(c, "Prompts per week", "Claude Code prompts come from your prompt history, which goes back further than the transcripts (those are pruned after ~30 days by default). Cowork prompts come from its transcripts." + (HAS_CURSOR ? " Cursor prompts come from its conversation store." : ""));
   const h0 = Math.max(s0, firstHistDay === Infinity ? s0 : firstHistDay);
   const weeks = new Map();
   for (let i = h0; i < D.days.length; i++) {
@@ -664,12 +695,12 @@ function render() {
 
   // Sessions table
   c = document.getElementById("c-sessions");
-  cardHeader(c, "Sessions", "Sorted by estimated cost (includes subagents). Click a column header to sort. Titles are auto-generated summaries. Recorded cost is what Cowork logged itself.");
+  cardHeader(c, "Sessions", "Sorted by estimated cost (includes subagents). Click a column header to sort. Titles are auto-generated summaries. Recorded cost is what Cowork logged itself." + (HAS_CURSOR ? " Cursor conversations have no cost or API-call data." : ""));
   const sorted = [...sess].sort((a, b) => b[10] - a[10]);
   tableView(c, ["Started", "Title", "App", "Project", "Cost", "Recorded", "Active", "Prompts", "API calls", "Tool calls", "Subagents", "Compactions", "MRs"],
     sorted.map(r => [D.days[r[1]], r[3] || r[0].slice(0, 8), APP_NAMES[r[12]] + (r[13] ? " (scheduled)" : ""), D.projects[r[2]] ?? "",
-      {display: usd(r[10]), sort: r[10]}, {display: r[14] < 0 ? "–" : usd(r[14]), sort: r[14]}, {display: dur(r[4]), sort: r[4]},
-      r[11], r[5], r[6], r[7], r[8], r[9]]), {open: true, title: `${sess.length} sessions`, numeric: [4, 5, 6, 7, 8, 9, 10, 11, 12]});
+      {display: r[12] === 2 ? "–" : usd(r[10]), sort: r[10]}, {display: r[14] < 0 ? "–" : usd(r[14]), sort: r[14]}, {display: dur(r[4]), sort: r[4]},
+      r[11], r[12] === 2 ? {display: "–", sort: -1} : r[5], r[6], r[7], r[8], r[9]]), {open: true, title: `${sess.length} sessions`, numeric: [4, 5, 6, 7, 8, 9, 10, 11, 12]});
 
   // Files + skills/agents
   c = document.getElementById("c-files");
@@ -695,9 +726,17 @@ function render() {
     {display: intf(r.err), sort: r.err}, {display: r.p50 == null ? "–" : dur(r.p50), sort: r.p50 ?? -1}]), {open: true, title: `${sk.length} skills/agent types`, numeric: [2, 3, 4]});
 
   renderCowork(calls, cost, sum, d0, dayLabels, tile);
+  renderCursor(sess, tools, hist, sum, tile);
+  // Cursor records no API calls or tokens, so the cost and token cards are empty for it alone.
+  const noCalls = state.app === "2";
+  for (const id of ["kpis", "c-cost", "c-app", "c-tokentype", "c-thread", "c-heat-claude", "c-context"]) {
+    const e = document.getElementById(id), g = e.parentElement;
+    e.hidden = noCalls;
+    if (g.classList.contains("grid")) g.hidden = noCalls && [...g.children].every(x => x.hidden);
+  }
 
   document.getElementById("subtitle").textContent =
-    `Built ${D.built} from ~/.claude${D.cwTurns.length ? " and Claude Cowork" : ""} · transcripts ${D.days[firstCallDay] ?? "–"} → ${D.days[D.days.length - 1]} · prompt history from ${D.days[firstHistDay] ?? "–"} · no prompt or response text included`;
+    `Built ${D.built} from ~/.claude${D.cwTurns.length ? ", Claude Cowork" : ""}${HAS_CURSOR ? ", Cursor" : ""} · transcripts ${D.days[firstCallDay] ?? "–"} → ${D.days[D.days.length - 1]} · prompt history from ${D.days[firstHistDay] ?? "–"} · no prompt or response text included`;
 }
 
 // ---------- Cowork ----------
@@ -705,7 +744,7 @@ const LIMIT_NAMES = {five_hour: "5-hour window", overage: "Overage", unknown: "U
 const LIMIT_ORDER = ["five_hour", "overage", "unknown"];
 function renderCowork(calls, cost, sum, d0, dayLabels, tile) {
   const sec = document.getElementById("cowork");
-  sec.hidden = state.app === "0" || !D.cwTurns.length;
+  sec.hidden = (state.app !== "all" && state.app !== "1") || !D.cwTurns.length;
   if (sec.hidden) return;
   const turns = D.cwTurns.filter(r => keep(r[0], r[1], null, 1));
   const limits = D.rateLimits.filter(r => keep(r[0], r[1], null, 1));
@@ -781,6 +820,106 @@ function renderCowork(calls, cost, sum, d0, dayLabels, tile) {
   } else c.append(el("div", {class: "empty"}, "No rate-limit events in this slice"));
 }
 
+// ---------- Cursor ----------
+const MODE_NAMES = {agent: "Agent", chat: "Ask", debug: "Debug", unknown: "Unrecorded"};
+function renderCursor(sess, tools, hist, sum, tile) {
+  const sec = document.getElementById("cursor");
+  sec.hidden = (state.app !== "all" && state.app !== "2") || !HAS_CURSOR;
+  if (sec.hidden) return;
+  const s0 = startIdx();
+  const msgs = D.cursorMsgs.filter(r => keep(r[0], r[1], r[2], 2));
+  const cs = sess.filter(r => r[12] === 2), ct = tools.filter(r => r[10] === 2), cp = hist.filter(r => r[3] === 2);
+  // Commits and billed usage carry no project, so a project filter hides them rather than showing everything.
+  const commits = state.proj >= 0 ? [] : D.cursorCommits.filter(r => r[0] >= s0);
+  const usage = state.proj >= 0 ? [] : D.cursorUsage.filter(r => r[0] >= s0);
+  const errs = sum(ct, r => r[5]), la = sum(cs, r => r[16]), lr = sum(cs, r => r[17]);
+  const cl = sum(commits, r => r[1]), ai = sum(commits, r => r[2] + r[3]);
+  const agentN = cs.filter(r => D.cursorModes[r[15]] === "agent").length;
+  document.getElementById("kpis4").replaceChildren(
+    tile("Conversations", intf(cs.length), cs.length ? `${pct(agentN / cs.length)} in agent mode` : ""),
+    tile("Your prompts", intf(cp.length), `${(cp.length / Math.max(1, cs.length)).toFixed(1)} per conversation`),
+    tile("Tool calls", intf(ct.length), `${pct(errs / Math.max(1, ct.length))} failed`),
+    tile("Lines changed by the agent", "+" + compact(la), `-${compact(lr)} removed, as Cursor counts them`),
+    tile("AI share of committed lines", commits.length && cl ? pct(ai / cl) : "–",
+      commits.length ? `${intf(cl)} lines in ${intf(commits.length)} commits` : (state.proj >= 0 ? "commits have no project" : "no tracked commits")));
+
+  // Daily assistant messages by model
+  const d0 = Math.max(s0, msgs.reduce((m, r) => Math.min(m, r[0]), Infinity));
+  let c = document.getElementById("c-cu-daily");
+  cardHeader(c, "Daily assistant messages by model", "Each reply or tool step from Cursor's agent. These are messages, not API calls: Cursor records neither calls nor (since early 2026) tokens.");
+  if (msgs.length) {
+    const labels = D.days.slice(d0);
+    const v = D.cursorModels.map(() => new Array(labels.length).fill(0));
+    for (const r of msgs) if (r[0] >= d0) v[r[3]][r[0] - d0]++;
+    const series = D.cursorModels.map((name, i) => ({name, color: name === "Other" ? OTHER : SERIES[i], values: v[i]}))
+      .filter(s => s.values.some(x => x));
+    legend(c, series);
+    stackedColumns(c, {labels, series, fmt: intf});
+    tableView(c, ["Date", ...series.map(s => s.name), "Total"], labels.map((d, i) => {
+      const t = series.reduce((a, s) => a + s.values[i], 0);
+      return [d, ...series.map(s => s.values[i]), t];
+    }).filter(r => r[r.length - 1]).reverse(), {numeric: series.map((_, i) => i + 1).concat(series.length + 1)});
+  } else c.append(el("div", {class: "empty"}, "No Cursor messages in this slice"));
+
+  // Models
+  c = document.getElementById("c-cu-models");
+  cardHeader(c, "Models", `Assistant messages per model. "default" is Cursor's Auto setting, which doesn't record the model it picked.`);
+  const byModel = D.cursorModels.map((name, i) => ({label: name, value: msgs.filter(r => r[3] === i).length,
+    tools: msgs.filter(r => r[3] === i && r[5]).length})).filter(r => r.value).sort((a, b) => b.value - a.value);
+  hBars(c, {rows: byModel, fmt: compact, labelW: 220,
+    tipRows: r => [{value: intf(r.value), name: "messages"}, {value: pct(r.tools / r.value), name: "were tool steps"}]});
+  tableView(c, ["Model", "Messages", "Tool steps"], byModel.map(r => [r.label, {display: intf(r.value), sort: r.value}, {display: intf(r.tools), sort: r.tools}]), {numeric: [1, 2]});
+
+  // Modes
+  c = document.getElementById("c-cu-modes");
+  cardHeader(c, "Conversation modes", "Conversations per mode, with your prompts and the agent's line changes.");
+  const mm = new Map();
+  for (const r of cs) {
+    const k = r[15] >= 0 ? D.cursorModes[r[15]] : "unknown";
+    const g = mm.get(k) || {n: 0, prompts: 0, la: 0, lr: 0};
+    g.n++; g.prompts += r[11]; g.la += r[16]; g.lr += r[17]; mm.set(k, g);
+  }
+  const modeRows = [...mm.entries()].map(([k, g]) => ({label: MODE_NAMES[k] || k, value: g.n, ...g})).sort((a, b) => b.value - a.value);
+  hBars(c, {rows: modeRows, fmt: intf,
+    tipRows: r => [{value: intf(r.n), name: "conversations"}, {value: intf(r.prompts), name: "prompts"}, {value: "+" + compact(r.la), name: "lines added"}]});
+  tableView(c, ["Mode", "Conversations", "Prompts", "Lines added", "Lines removed"], modeRows.map(r =>
+    [r.label, {display: intf(r.n), sort: r.n}, {display: intf(r.prompts), sort: r.prompts}, {display: compact(r.la), sort: r.la}, {display: compact(r.lr), sort: r.lr}]),
+    {open: true, numeric: [1, 2, 3, 4]});
+
+  // Committed lines by author, weekly
+  c = document.getElementById("c-cu-lines");
+  cardHeader(c, "Committed lines by author", "Lines added per week in commits Cursor scored: written by the agent, accepted Tab completions, or typed by you. Only covers commits made while Cursor was tracking.");
+  if (commits.length) {
+    const weeks = new Map();
+    for (const r of commits) {
+      const wk = D.days[r[0] - weekday(D.days[r[0]])] || D.days[r[0]];
+      const g = weeks.get(wk) || [0, 0, 0, 0]; g[0] += r[2]; g[1] += r[3]; g[2] += r[4]; g[3]++; weeks.set(wk, g);
+    }
+    const wl = [...weeks.keys()].sort();
+    const series = [["Agent", 0], ["Tab", 1], ["You", 2]].map(([name, j], i) => ({name, color: SERIES[i], values: wl.map(k => weeks.get(k)[j])}));
+    legend(c, series);
+    stackedColumns(c, {labels: wl, series, fmt: compact, height: 220});
+    tableView(c, ["Week of", "Commits", "Agent", "Tab", "You"], wl.map(k => { const g = weeks.get(k); return [k, g[3], g[0], g[1], g[2]]; }).reverse(), {numeric: [1, 2, 3, 4]});
+  } else c.append(el("div", {class: "empty"}, state.proj >= 0 ? "Commit tracking has no project; choose All projects" : "No tracked commits in this slice"));
+
+  // Billed usage (CSV import)
+  c = document.getElementById("c-cu-usage");
+  cardHeader(c, "Billed usage", "From usage CSVs exported at cursor.com/dashboard. Not split by project.");
+  if (D.cursorUsage.length && usage.length) {
+    const um = new Map();
+    for (const r of usage) { const g = um.get(r[1]) || {cost: 0, tokens: 0, n: 0}; g.cost += r[3]; g.tokens += r[2]; g.n++; um.set(r[1], g); }
+    const rows = [...um.entries()].map(([k, g]) => ({label: D.cursorUsageModels[k], value: g.cost, ...g})).sort((a, b) => b.value - a.value);
+    const head = el("p", {class: "desc"}, `${usd(sum(usage, r => r[3]))} billed · ${compact(sum(usage, r => r[2]))} tokens in ${intf(usage.length)} requests`);
+    c.append(head);
+    hBars(c, {rows: rows.slice(0, 12), fmt: usd, labelW: 220,
+      tipRows: r => [{value: usd(r.cost), name: "billed"}, {value: compact(r.tokens), name: "tokens"}, {value: intf(r.n), name: "requests"}]});
+    tableView(c, ["Model", "Requests", "Tokens", "Cost"], rows.map(r => [r.label, {display: intf(r.n), sort: r.n},
+      {display: compact(r.tokens), sort: r.tokens}, {display: usd(r.cost), sort: r.cost}]), {numeric: [1, 2, 3]});
+  } else if (D.cursorUsage.length) c.append(el("div", {class: "empty"}, state.proj >= 0 ? "Billed usage has no project; choose All projects" : "No billed usage in this slice"));
+  else c.append(el("p", {class: "desc"}, "No usage CSV imported. To add billed cost, export your usage CSV from cursor.com/dashboard and rerun "
+    + "python extract.py --cursor-usage-csv path/to/usage.csv (repeat the flag for several exports)."));
+}
+
 // ---------- controls ----------
 function seg(id, key) {
   const box = document.getElementById(id);
@@ -790,10 +929,13 @@ function seg(id, key) {
 }
 seg("range", "range"); seg("thread", "thread"); seg("app", "app");
 const projSel = document.getElementById("proj");
-const projCost = new Map();
+// Projects ordered by cost, then (for projects with no cost, e.g. Cursor-only) by sessions.
+const projCost = new Map(), projSess = new Map();
 for (const r of D.calls) projCost.set(r[1], (projCost.get(r[1]) || 0) + r[9] + r[10] + r[11] + r[12]);
+for (const r of D.sessions) projSess.set(r[2], (projSess.get(r[2]) || 0) + 1);
 projSel.append(el("option", {value: -1}, "All projects"));
-D.projects.map((p, i) => [p, i]).filter(([, i]) => projCost.has(i)).sort((a, b) => projCost.get(b[1]) - projCost.get(a[1]))
+D.projects.map((p, i) => [p, i]).filter(([, i]) => projCost.has(i) || projSess.has(i))
+  .sort((a, b) => (projCost.get(b[1]) || 0) - (projCost.get(a[1]) || 0) || (projSess.get(b[1]) || 0) - (projSess.get(a[1]) || 0))
   .forEach(([p, i]) => projSel.append(el("option", {value: i}, p)));
 projSel.addEventListener("change", () => { state.proj = Number(projSel.value); render(); });
 document.getElementById("theme").addEventListener("click", () => {

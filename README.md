@@ -13,7 +13,10 @@ Python 3.10+ and the standard library are all you need: no dependencies, no netw
 ```
 python extract.py                    # ~/.claude -> out/usage.sqlite + out/csv/*.csv
 python build_dashboard.py --open     # -> out/dashboard.html
+python build_artifact.py             # -> out/artifact.html, ready to publish as a claude.ai Artifact
 ```
+
+`skill/claude-usage-report.skill` packages these scripts as a shareable skill. It contains no data; each person who runs it reads their own.
 
 `extract.py --no-titles` omits auto-generated session titles. `--no-cowork` skips Cowork; `--cowork-dir PATH` points at a non-default Cowork folder.
 
